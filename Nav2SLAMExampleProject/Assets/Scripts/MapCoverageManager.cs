@@ -56,18 +56,27 @@ public class MapCoverageManager : MonoBehaviour
     [Tooltip("Scan for obstacles at startup and mark blocked cells")]
     public bool scanForObstacles = true;
     
-    [Tooltip("Height to cast rays from (should be above obstacles)")]
-    public float scanHeight = 5f;
+    [Tooltip("Tags that count as obstacles (will block cells). Only include tags that EXIST in your project!")]
+    public string[] obstacleTags = { "Obstacle", "Shelf", "Box" };  // Removed "Wall" - add it back if you create the tag
     
-    [Tooltip("Layers that count as obstacles (block cells)")]
-    public LayerMask obstacleLayerMask = -1;
+    [Tooltip("Also find obstacles by name patterns (partial match)")]
+    public string[] obstacleNamePatterns = { "Shelving", "Rack", "box", "Box" };
     
-    [Tooltip("Tags to IGNORE when scanning (e.g. Floor, Robot)")]
-    public string[] ignoreTags = { "Floor", "Robot", "Untagged" };
+    [Tooltip("Name patterns to EXCLUDE from obstacles (robots, floors, etc.)")]
+    public string[] excludeNamePatterns = { "robot", "Robot", "wheel", "caster", "base_", "floor", "Floor", 
+                                            "ground", "Ground", "ceiling", "Ceiling", "plane", "Plane" };
     
-    [Tooltip("Click to rescan obstacles (useful after moving things)")]
-    [ContextMenuItem("Rescan Obstacles Now", "RescanObstacles")]
-    public bool rescanButton = false;  // Dummy field for context menu
+    [Tooltip("Update blocked cells every frame (for moving obstacles)")]
+    public bool realtimeObstacleTracking = false;
+    
+    [Tooltip("How often to update obstacle tracking (seconds)")]
+    public float obstacleUpdateInterval = 0.5f;
+    
+    [Header("Manual Controls")]
+    [Tooltip("Set to true and it will trigger a rescan on next frame")]
+    public bool triggerRescan = false;
+    
+    private float lastObstacleUpdateTime = 0f;
     
     [Header("Debug Visualization")]
     public bool showDebugGrid = true;
@@ -106,7 +115,9 @@ public class MapCoverageManager : MonoBehaviour
         }
         Instance = this;
         
-        InitializeGrid();
+        // Initialize grid structure but DON'T scan yet
+        // (obstacles may not be spawned yet during Awake)
+        InitializeGridStructure();
     }
     
     void Start()
@@ -146,6 +157,86 @@ public class MapCoverageManager : MonoBehaviour
             
             Debug.Log($"[MapCoverageManager] Auto-found {robots.Count} robots");
         }
+        
+        // NOW scan for obstacles - after all Start() methods have run
+        // Use Invoke to delay slightly, ensuring all spawners have finished
+        Invoke(nameof(DelayedObstacleScan), 0.1f);
+    }
+    
+    private void DelayedObstacleScan()
+    {
+        if (scanForObstacles)
+        {
+            ScanForObstacles();
+            Debug.Log($"[MapCoverageManager] Delayed obstacle scan triggered");
+        }
+    }
+    
+    void Update()
+    {
+        // Check for manual rescan trigger
+        if (triggerRescan)
+        {
+            triggerRescan = false;
+            RescanObstacles();
+        }
+        
+        // Real-time obstacle tracking (for moving obstacles like falling boxes)
+        if (realtimeObstacleTracking && Time.time - lastObstacleUpdateTime > obstacleUpdateInterval)
+        {
+            lastObstacleUpdateTime = Time.time;
+            UpdateObstacleTracking();
+        }
+    }
+    
+    /// <summary>
+    /// Lightweight update for tracking moving obstacles.
+    /// Only updates cells, doesn't log to console.
+    /// Reuses the same IsObstacle and ShouldExclude logic.
+    /// </summary>
+    private void UpdateObstacleTracking()
+    {
+        // Clear blocked status
+        for (int x = 0; x < cellsX; x++)
+            for (int z = 0; z < cellsZ; z++)
+                blocked[x, z] = false;
+        
+        blockedCount = 0;
+        
+        // Find all colliders with obstacle tags/names
+        Collider[] allColliders = FindObjectsOfType<Collider>();
+        
+        foreach (Collider col in allColliders)
+        {
+            if (col.isTrigger) continue;
+            
+            // Skip robots, floors, ceilings
+            if (ShouldExcludeFromObstacles(col)) continue;
+            
+            // Check if it's an obstacle
+            if (!IsObstacle(col)) continue;
+            
+            // Mark cells as blocked
+            Bounds bounds = col.bounds;
+            int minCellX = Mathf.Max(0, Mathf.FloorToInt((bounds.min.x - areaMin.x) / cellSize));
+            int maxCellX = Mathf.Min(cellsX - 1, Mathf.CeilToInt((bounds.max.x - areaMin.x) / cellSize));
+            int minCellZ = Mathf.Max(0, Mathf.FloorToInt((bounds.min.z - areaMin.y) / cellSize));
+            int maxCellZ = Mathf.Min(cellsZ - 1, Mathf.CeilToInt((bounds.max.z - areaMin.y) / cellSize));
+            
+            for (int x = minCellX; x <= maxCellX; x++)
+            {
+                for (int z = minCellZ; z <= maxCellZ; z++)
+                {
+                    if (!blocked[x, z])
+                    {
+                        blocked[x, z] = true;
+                        blockedCount++;
+                    }
+                }
+            }
+        }
+        
+        reachableCount = totalCount - blockedCount;
     }
     
     void FixedUpdate()
@@ -158,7 +249,10 @@ public class MapCoverageManager : MonoBehaviour
     // INITIALIZATION
     // ========================================================================
     
-    private void InitializeGrid()
+    /// <summary>
+    /// Initialize grid arrays - called during Awake (before obstacles spawn)
+    /// </summary>
+    private void InitializeGridStructure()
     {
         cellsX = Mathf.CeilToInt((areaMax.x - areaMin.x) / cellSize);
         cellsZ = Mathf.CeilToInt((areaMax.y - areaMin.y) / cellSize);
@@ -167,86 +261,75 @@ public class MapCoverageManager : MonoBehaviour
         totalCount = cellsX * cellsZ;
         visitedCount = 0;
         blockedCount = 0;
+        reachableCount = totalCount;  // Assume all reachable until scan
         lastCoverageFraction = 0f;
         
         Debug.Log($"[MapCoverageManager] Grid initialized: {cellsX}x{cellsZ} = {totalCount} cells");
-        
-        // Scan for obstacles if enabled
-        if (scanForObstacles)
-        {
-            ScanForObstacles();
-        }
-        else
-        {
-            reachableCount = totalCount;
-        }
     }
     
     /// <summary>
-    /// Scans the environment from above to detect which cells are blocked by obstacles.
-    /// Blocked cells are marked and excluded from the coverage calculation.
+    /// Scans the environment to detect which cells are blocked by obstacles.
+    /// Uses collider bounds instead of raycasting (more reliable).
     /// </summary>
     private void ScanForObstacles()
     {
-        blockedCount = 0;
-        
+        // Clear previous blocked status
         for (int x = 0; x < cellsX; x++)
-        {
             for (int z = 0; z < cellsZ; z++)
+                blocked[x, z] = false;
+        
+        blockedCount = 0;
+        HashSet<string> detectedObjects = new HashSet<string>();
+        
+        // Find all colliders in the scene
+        Collider[] allColliders = FindObjectsOfType<Collider>();
+        
+        foreach (Collider col in allColliders)
+        {
+            // Skip triggers
+            if (col.isTrigger) continue;
+            
+            // FIRST: Check if this should be excluded (robots, floors, ceilings)
+            if (ShouldExcludeFromObstacles(col))
+                continue;
+            
+            // Check if this object is an obstacle
+            bool isObstacle = IsObstacle(col);
+            
+            if (!isObstacle) continue;
+            
+            string objName = col.gameObject.name;
+            string objTag = col.tag;
+            
+            // Get the bounds of this obstacle and mark cells
+            Bounds bounds = col.bounds;
+            
+            // Find all cells that overlap with this obstacle's footprint
+            int minCellX = Mathf.FloorToInt((bounds.min.x - areaMin.x) / cellSize);
+            int maxCellX = Mathf.CeilToInt((bounds.max.x - areaMin.x) / cellSize);
+            int minCellZ = Mathf.FloorToInt((bounds.min.z - areaMin.y) / cellSize);
+            int maxCellZ = Mathf.CeilToInt((bounds.max.z - areaMin.y) / cellSize);
+            
+            // Clamp to grid bounds
+            minCellX = Mathf.Max(0, minCellX);
+            maxCellX = Mathf.Min(cellsX - 1, maxCellX);
+            minCellZ = Mathf.Max(0, minCellZ);
+            maxCellZ = Mathf.Min(cellsZ - 1, maxCellZ);
+            
+            // Mark cells as blocked
+            for (int x = minCellX; x <= maxCellX; x++)
             {
-                Vector3 cellCenter = CellToWorld(x, z);
-                Vector3 rayOrigin = cellCenter + Vector3.up * scanHeight;
-                
-                // Cast ray downward to check for obstacles
-                if (Physics.Raycast(rayOrigin, Vector3.down, out RaycastHit hit, scanHeight + 1f, obstacleLayerMask))
+                for (int z = minCellZ; z <= maxCellZ; z++)
                 {
-                    // Check if the hit object should be ignored
-                    bool shouldIgnore = false;
-                    
-                    // Check tag
-                    foreach (string ignoreTag in ignoreTags)
-                    {
-                        if (hit.collider.CompareTag(ignoreTag))
-                        {
-                            shouldIgnore = true;
-                            break;
-                        }
-                    }
-                    
-                    // Also check parent tags (for URDF hierarchies)
-                    if (!shouldIgnore)
-                    {
-                        Transform parent = hit.collider.transform.parent;
-                        while (parent != null && !shouldIgnore)
-                        {
-                            foreach (string ignoreTag in ignoreTags)
-                            {
-                                if (parent.CompareTag(ignoreTag))
-                                {
-                                    shouldIgnore = true;
-                                    break;
-                                }
-                            }
-                            parent = parent.parent;
-                        }
-                    }
-                    
-                    // Check if it's a floor/ground by name (backup check)
-                    string nameLower = hit.collider.name.ToLower();
-                    if (nameLower.Contains("floor") || nameLower.Contains("ground") || 
-                        nameLower.Contains("plane"))
-                    {
-                        shouldIgnore = true;
-                    }
-                    
-                    // If not ignored, this cell is blocked
-                    if (!shouldIgnore)
+                    if (!blocked[x, z])
                     {
                         blocked[x, z] = true;
                         blockedCount++;
                     }
                 }
             }
+            
+            detectedObjects.Add($"{objName} (tag:{objTag})");
         }
         
         reachableCount = totalCount - blockedCount;
@@ -255,6 +338,113 @@ public class MapCoverageManager : MonoBehaviour
         Debug.Log($"[MapCoverageManager] Obstacle scan complete: " +
                   $"{blockedCount} blocked cells ({blockedPercent:F1}%), " +
                   $"{reachableCount} reachable cells");
+        
+        if (detectedObjects.Count > 0)
+        {
+            Debug.Log($"[MapCoverageManager] Detected {detectedObjects.Count} obstacle types: " +
+                      $"{string.Join(", ", detectedObjects)}");
+        }
+        else
+        {
+            Debug.LogWarning($"[MapCoverageManager] ⚠️ NO obstacles detected!\n" +
+                           $"  - Check that obstacles have tags: {string.Join(", ", obstacleTags)}\n" +
+                           $"  - Or match name patterns: {string.Join(", ", obstacleNamePatterns)}");
+        }
+    }
+    
+    /// <summary>
+    /// Check if a collider should be EXCLUDED from obstacle detection.
+    /// Returns true for robots, floors, ceilings, etc.
+    /// </summary>
+    private bool ShouldExcludeFromObstacles(Collider col)
+    {
+        string objName = col.gameObject.name;
+        
+        // Check exclude patterns (name-based)
+        foreach (string pattern in excludeNamePatterns)
+        {
+            if (objName.IndexOf(pattern, System.StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        
+        // Check if it's part of a robot by looking for ArticulationBody (URDF robots use this)
+        // and checking if parent hierarchy contains "robot" in the name
+        ArticulationBody artBody = col.GetComponentInParent<ArticulationBody>();
+        if (artBody != null)
+        {
+            // Check if any parent is named "robot1", "robot2", etc.
+            Transform t = col.transform;
+            while (t != null)
+            {
+                if (t.name.ToLower().Contains("robot"))
+                    return true;
+                t = t.parent;
+            }
+        }
+        
+        // Check if tagged as Robot, Floor, or Ceiling
+        if (SafeCompareTag(col.gameObject, "Robot")) return true;
+        if (SafeCompareTag(col.gameObject, "Floor")) return true;
+        if (SafeCompareTag(col.gameObject, "Ceiling")) return true;
+        
+        // Also check parent tags
+        Transform parent = col.transform.parent;
+        while (parent != null)
+        {
+            if (SafeCompareTag(parent.gameObject, "Robot")) return true;
+            parent = parent.parent;
+        }
+        
+        return false;
+    }
+    
+    /// <summary>
+    /// Check if a collider is an obstacle (by tag or name pattern).
+    /// Uses safe tag comparison that doesn't throw if tag doesn't exist.
+    /// </summary>
+    private bool IsObstacle(Collider col)
+    {
+        // Check by tag (with safe comparison)
+        foreach (string obstacleTag in obstacleTags)
+        {
+            if (SafeCompareTag(col.gameObject, obstacleTag))
+                return true;
+            
+            // Also check parents
+            Transform parent = col.transform.parent;
+            while (parent != null)
+            {
+                if (SafeCompareTag(parent.gameObject, obstacleTag))
+                    return true;
+                parent = parent.parent;
+            }
+        }
+        
+        // Check by name pattern
+        string objName = col.gameObject.name;
+        foreach (string pattern in obstacleNamePatterns)
+        {
+            if (objName.IndexOf(pattern, System.StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        
+        return false;
+    }
+    
+    /// <summary>
+    /// Safely compare tag without throwing exception if tag doesn't exist.
+    /// </summary>
+    private bool SafeCompareTag(GameObject obj, string tag)
+    {
+        try
+        {
+            return obj.CompareTag(tag);
+        }
+        catch
+        {
+            // Tag doesn't exist in project - just return false
+            return false;
+        }
     }
     
     // ========================================================================
